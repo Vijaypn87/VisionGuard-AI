@@ -34,7 +34,7 @@ A real-time pipeline that detects and tracks people/objects in video streams, th
 ## Quick Start
 
 ```bash
-git clone https://github.com/Pari2003/Real-Time-Video-Anomaly-Detection.git
+git clone https://github.com/Vijaypn87/VisionGuard-AI.git
 cd Real-Time-Video-Anomaly-Detection
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
