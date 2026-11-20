@@ -1,6 +1,6 @@
 FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
-LABEL maintainer="Pari2003 <maitraiyeebhatt@gmail.com>"
+LABEL maintainer="vijaypn <vijaypn.in@gmail.com>"
 LABEL description="Real-Time Video Anomaly Detection Pipeline"
 
 # System dependencies
