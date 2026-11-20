@@ -13,14 +13,14 @@ with open("requirements.txt", "r", encoding="utf-8") as f:
     ]
 
 setup(
-    name="video-anomaly-detection",
+    name="Vijaypn",
     version="1.0.0",
-    author="Pari2003",
-    author_email="maitraiyeebhatt@gmail.com",
+    author="vijaypn",
+    author_email="Vijaypn.in@gmail.com",
     description="Real-time multi-object tracking and video anomaly detection using YOLOv8, ByteTrack, and VideoMAE",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/Pari2003/Real-Time-Video-Anomaly-Detection",
+    url="https://github.com/Vijaypn87/VisionGuard-AI",
     packages=find_packages(),
     python_requires=">=3.9",
     install_requires=requirements,
