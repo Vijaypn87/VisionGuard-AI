@@ -48,15 +48,6 @@ python -m src.pipeline --source "rtsp://camera.local/stream1"
 streamlit run dashboard/app.py
 ```
 
-## Performance
-
-| Metric | Score |
-|--------|-------|
-| ROC-AUC (UCF-Crime) | 85.0% |
-| F1-Score | 70.0% |
-| Inference (ONNX, CUDA) | ~92 FPS |
-| Inference (TensorRT FP16) | ~139 FPS |
-
 ## Project Structure
 
 ```
