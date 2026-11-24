@@ -1,8 +1,7 @@
-"""Real-Time Video Anomaly Detection Pipeline.
+"""Video anomaly detection pipeline.
 
-A production-grade pipeline combining YOLOv8 detection, ByteTrack multi-object
-tracking, and VideoMAE temporal anomaly classification for real-time surveillance
-video analysis.
+YOLOv8 detection and ByteTrack tracking, plus clip-level anomaly scoring from
+frozen VideoMAE features and a MIL head trained on UCF-Crime.
 """
 
 __version__ = "1.0.0"

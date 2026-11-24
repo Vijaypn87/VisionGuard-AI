@@ -28,8 +28,8 @@ def quantize_fp16(
         Path to the quantized model.
     """
     try:
-        from onnxconverter_common import float16
         import onnx
+        from onnxconverter_common import float16
     except ImportError:
         logger.error("Install: pip install onnxconverter-common onnx")
         raise
@@ -73,7 +73,7 @@ def quantize_int8_dynamic(
         Path to the quantized model.
     """
     try:
-        from onnxruntime.quantization import quantize_dynamic, QuantType
+        from onnxruntime.quantization import QuantType, quantize_dynamic
     except ImportError:
         logger.error("Install: pip install onnxruntime")
         raise

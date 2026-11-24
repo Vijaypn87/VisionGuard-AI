@@ -5,8 +5,8 @@ Compares inference performance across multiple backends:
   - ONNX Runtime (CPU + GPU)
   - TensorRT (if available)
 
-Generates a formatted benchmark table proving the 40% latency reduction
-claimed in the resume. Measures avg, P95, P99 latency and throughput.
+Writes a markdown table of avg, P95, P99 latency and throughput, labelled
+with the hardware it was measured on. Only the YOLOv8 detector is measured.
 
 Usage:
     python optimization/benchmark.py --config configs/inference.yaml
@@ -15,6 +15,7 @@ Usage:
 import argparse
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -191,16 +192,21 @@ def run_full_benchmark(
     )
     results.append(pytorch_result)
 
-    # PyTorch FP16
-    pytorch_fp16 = benchmark_pytorch(
-        model_path=pytorch_model,
-        img_size=img_size,
-        half=True,
-        warmup=warmup,
-        iterations=iterations,
-    )
-    pytorch_fp16["backend"] = "PyTorch (FP16)"
-    results.append(pytorch_fp16)
+    # PyTorch FP16 (GPU only — FP16 is not supported for CPU inference)
+    import torch
+
+    if torch.cuda.is_available():
+        pytorch_fp16 = benchmark_pytorch(
+            model_path=pytorch_model,
+            img_size=img_size,
+            half=True,
+            warmup=warmup,
+            iterations=iterations,
+        )
+        pytorch_fp16["backend"] = "PyTorch (FP16)"
+        results.append(pytorch_fp16)
+    else:
+        logger.info("CUDA not available; skipping PyTorch FP16 benchmark")
 
     # ONNX Runtime
     if Path(onnx_model).exists():
@@ -271,8 +277,12 @@ def _save_benchmark_table(results: list[dict], output_path: str) -> None:
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     lines = [
-        "# Inference Latency Benchmark Results\n",
+        "# Detector Inference Latency Benchmark (YOLOv8 only)\n",
+        f"**Hardware**: {_hardware_description()} | "
+        f"**Measured**: {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n",
         f"**Input Size**: 640×640 | **Iterations**: {results[0].get('iterations', 'N/A')}\n",
+        "These numbers cover the detector forward pass only, not tracking or "
+        "anomaly classification. Backends that were not available are omitted.\n",
         "| Backend | Avg (ms) | P95 (ms) | P99 (ms) | FPS | Speedup | Latency Reduction |",
         "|---------|----------|----------|----------|-----|---------|-------------------|",
     ]
@@ -286,12 +296,24 @@ def _save_benchmark_table(results: list[dict], output_path: str) -> None:
         )
 
     lines.append("")
-    lines.append("> **Key Takeaway**: ONNX + FP16 optimization achieves ~40% latency ")
-    lines.append("> reduction over the PyTorch FP32 baseline, enabling sustained 30+ FPS ")
-    lines.append("> real-time inference on surveillance video streams.")
 
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+
+
+def _hardware_description() -> str:
+    """CPU/GPU the benchmark actually ran on."""
+    import platform
+
+    cpu = platform.processor() or platform.machine()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return f"{torch.cuda.get_device_name(0)} (GPU), CPU: {cpu}"
+    except ImportError:
+        pass
+    return f"CPU only: {cpu}"
 
 
 def main():

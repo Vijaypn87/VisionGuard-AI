@@ -1,41 +1,39 @@
-"""VideoMAE-based temporal anomaly classifier.
+"""VideoMAE features + trained MIL head for clip-level anomaly scoring.
 
-Classifies short video clips (16 frames) extracted from tracked objects as
-normal or anomalous using a VideoMAE (Video Masked Autoencoder) backbone
-fine-tuned on the UCF-Crime dataset.
+The classifier has two parts:
 
-Supports two classification modes:
-  1. **Binary** — Normal vs. Anomalous (production deployment).
-  2. **Multi-class** — 13 anomaly categories + Normal (evaluation).
+1. ``ClipFeatureExtractor`` — a *frozen* VideoMAE backbone (by default the
+   Kinetics-400 fine-tuned checkpoint) that turns a 16-frame clip into a
+   768-d embedding (mean-pooled patch tokens).
+2. ``AnomalyHead`` — a small MLP that maps an embedding to an anomaly score
+   in [0, 1]. It is trained with the MIL ranking loss of Sultani et al.
+   (CVPR 2018) on UCF-Crime video-level labels; see ``training/train_mil.py``.
 
-The classifier operates on cropped track regions, enabling per-object anomaly
-scoring rather than full-frame analysis.
+The head **must be trained** before anomaly scores mean anything. If no head
+checkpoint is found, ``AnomalyClassifier`` raises ``AnomalyHeadNotFoundError``
+and the pipeline runs detection + tracking only, rather than reporting scores
+from randomly initialised weights.
 
 Typical usage:
-    classifier = AnomalyClassifier(config)
-    score = classifier.classify_clip(clip_frames)
+    classifier = AnomalyClassifier(config)          # loads backbone + head
+    result = classifier.classify_clip(clip_frames)  # list of BGR frames
 """
+
+from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from loguru import logger
 
-try:
-    from transformers import VideoMAEForVideoClassification, VideoMAEImageProcessor
-    HAS_TRANSFORMERS = True
-except ImportError:
-    HAS_TRANSFORMERS = False
-    logger.warning(
-        "transformers library not found. Install with: pip install transformers"
-    )
+DEFAULT_BACKBONE = "MCG-NJU/videomae-base-finetuned-kinetics"
+DEFAULT_HEAD_WEIGHTS = "weights/anomaly_head.pt"
 
-
-# UCF-Crime anomaly categories
+# UCF-Crime categories (used for dataset parsing and reporting).
 UCF_CRIME_CLASSES = [
     "Normal",
     "Abuse",
@@ -54,270 +52,244 @@ UCF_CRIME_CLASSES = [
 ]
 
 
+class AnomalyHeadNotFoundError(FileNotFoundError):
+    """Raised when no trained anomaly head checkpoint is available."""
+
+
 @dataclass
 class AnomalyResult:
-    """Container for anomaly classification output.
+    """Output of a single clip classification.
 
     Attributes:
-        anomaly_score:   Probability of anomaly (0 = normal, 1 = anomalous).
-        predicted_class: Predicted class name (e.g., "Fighting").
-        class_scores:    Dict mapping class names to probabilities.
-        is_anomaly:      Whether the score exceeds the threshold.
-        latency_ms:      Inference time in milliseconds.
+        anomaly_score: Score in [0, 1] from the trained head.
+        is_anomaly:    ``anomaly_score >= threshold``.
+        latency_ms:    Feature extraction + head inference time.
     """
 
     anomaly_score: float
-    predicted_class: str
-    class_scores: dict[str, float]
     is_anomaly: bool
     latency_ms: float
 
 
-class MILAggregator(nn.Module):
-    """Multiple Instance Learning (MIL) attention aggregator.
+# ── Model components ───────────────────────────────────────
 
-    Aggregates features from multiple clip instances using an attention
-    mechanism, enabling weakly-supervised training with video-level labels.
 
-    This is essential for the UCF-Crime dataset where only video-level
-    (not frame-level) annotations are available.
-    """
+class AnomalyHead(nn.Module):
+    """MLP scoring head (Sultani et al. 2018 layout: D → 512 → 32 → 1)."""
 
-    def __init__(self, feature_dim: int = 768, hidden_dim: int = 256):
+    def __init__(self, feature_dim: int = 768, hidden_dim: int = 512, dropout: float = 0.6):
         super().__init__()
-        self.attention = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.classifier = nn.Sequential(
+        self.feature_dim = feature_dim
+        self.hidden_dim = hidden_dim
+        self.net = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim, 1),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 32),
+            nn.Dropout(dropout),
+            nn.Linear(32, 1),
             nn.Sigmoid(),
         )
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """Aggregate bag of instance features.
+        """(..., D) → (...) scores in [0, 1]."""
+        return self.net(features).squeeze(-1)
 
-        Args:
-            features: (N, D) tensor of N instance feature vectors.
 
-        Returns:
-            Scalar anomaly score in [0, 1].
-        """
-        # Attention weights
-        attn_weights = self.attention(features)  # (N, 1)
-        attn_weights = F.softmax(attn_weights, dim=0)  # (N, 1)
+def mil_ranking_loss(
+    anomalous_scores: torch.Tensor,
+    normal_scores: torch.Tensor,
+    lambda_smooth: float = 8e-5,
+    lambda_sparse: float = 8e-5,
+) -> torch.Tensor:
+    """MIL ranking loss from Sultani et al., "Real-world Anomaly Detection in
+    Surveillance Videos" (CVPR 2018).
 
-        # Weighted aggregation
-        aggregated = torch.sum(attn_weights * features, dim=0, keepdim=True)  # (1, D)
+    Args:
+        anomalous_scores: (B, S) segment scores of anomalous videos (bags).
+        normal_scores:    (B, S) segment scores of normal videos.
 
-        # Classification
-        score = self.classifier(aggregated)  # (1, 1)
-        return score.squeeze()
+    Returns:
+        Scalar loss.
+    """
+    max_anomalous = anomalous_scores.max(dim=1).values
+    max_normal = normal_scores.max(dim=1).values
+    hinge = torch.relu(1.0 - max_anomalous + max_normal)
+
+    smoothness = ((anomalous_scores[:, 1:] - anomalous_scores[:, :-1]) ** 2).sum(dim=1)
+    sparsity = anomalous_scores.sum(dim=1)
+
+    return (hinge + lambda_smooth * smoothness + lambda_sparse * sparsity).mean()
+
+
+def save_head(head: AnomalyHead, path: str | Path, backbone: str, extra: dict | None = None) -> None:
+    """Save a trained head with the metadata needed to reload it safely."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": head.state_dict(),
+            "feature_dim": head.feature_dim,
+            "hidden_dim": head.hidden_dim,
+            "backbone": backbone,
+            "extra": extra or {},
+        },
+        path,
+    )
+
+
+def load_head(path: str | Path, device: torch.device | str = "cpu") -> tuple[AnomalyHead, dict]:
+    """Load a head checkpoint written by ``save_head``."""
+    path = Path(path)
+    if not path.exists():
+        raise AnomalyHeadNotFoundError(
+            f"No trained anomaly head at '{path}'. Train one with "
+            "`python -m training.train_mil extract ...` then "
+            "`python -m training.train_mil train ...` (see README)."
+        )
+    ckpt = torch.load(path, map_location=device, weights_only=True)
+    head = AnomalyHead(feature_dim=ckpt["feature_dim"], hidden_dim=ckpt["hidden_dim"])
+    head.load_state_dict(ckpt["state_dict"])
+    head.to(device).eval()
+    return head, ckpt
+
+
+def resolve_device(device_str: str) -> torch.device:
+    if device_str == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device_str)
+
+
+def normalize_clip_length(frames: list[np.ndarray], target: int) -> list[np.ndarray]:
+    """Pad (repeat last frame) or uniformly subsample to exactly ``target`` frames."""
+    if not frames:
+        raise ValueError("Cannot classify an empty clip")
+    n = len(frames)
+    if n == target:
+        return list(frames)
+    if n < target:
+        return list(frames) + [frames[-1]] * (target - n)
+    indices = np.linspace(0, n - 1, target, dtype=int)
+    return [frames[i] for i in indices]
+
+
+class ClipFeatureExtractor:
+    """Frozen VideoMAE backbone producing one embedding per clip.
+
+    Args:
+        backbone:    HuggingFace model ID or local path.
+        device:      torch device.
+        clip_length: Frames per clip expected by the backbone.
+        model / processor: Optional pre-built objects (used by tests).
+    """
+
+    def __init__(
+        self,
+        backbone: str = DEFAULT_BACKBONE,
+        device: torch.device | str = "cpu",
+        clip_length: int = 16,
+        model=None,
+        processor=None,
+    ):
+        self.backbone = backbone
+        self.device = torch.device(device)
+        self.clip_length = clip_length
+
+        if model is None or processor is None:
+            from transformers import VideoMAEImageProcessor, VideoMAEModel
+
+            logger.info(f"Loading VideoMAE backbone: {backbone}")
+            processor = VideoMAEImageProcessor.from_pretrained(backbone)
+            model = VideoMAEModel.from_pretrained(backbone)
+
+        self.processor = processor
+        self.model = model.to(self.device).eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+
+    @property
+    def feature_dim(self) -> int:
+        return int(self.model.config.hidden_size)
+
+    def preprocess(self, clips: list[list[np.ndarray]]) -> torch.Tensor:
+        """BGR clips → (B, T, C, H, W) pixel tensor."""
+        videos = []
+        for frames in clips:
+            frames = normalize_clip_length(frames, self.clip_length)
+            videos.append([np.ascontiguousarray(f[:, :, ::-1]) if f.ndim == 3 else f for f in frames])
+        return self.processor(videos, return_tensors="pt")["pixel_values"]
+
+    @torch.no_grad()
+    def extract(self, clips: list[list[np.ndarray]]) -> np.ndarray:
+        """Return (B, D) embeddings for a batch of clips."""
+        pixel_values = self.preprocess(clips).to(self.device)
+        hidden = self.model(pixel_values).last_hidden_state  # (B, tokens, D)
+        return hidden.mean(dim=1).cpu().numpy()
 
 
 class AnomalyClassifier:
-    """VideoMAE-based video anomaly classifier.
+    """Clip anomaly scorer = frozen VideoMAE features + trained MIL head.
 
-    Uses a pre-trained VideoMAE model as a temporal feature extractor and
-    classifier. Operates on 16-frame clips cropped from tracked object
-    bounding boxes.
+    Config keys (``anomaly:`` section):
+        backbone           HuggingFace ID of the VideoMAE backbone.
+        head_weights       Path to the trained head checkpoint.
+        clip_length        Frames per clip (16).
+        anomaly_threshold  Score threshold for ``is_anomaly``.
+        device             "auto" | "cpu" | "cuda:0".
 
-    Args:
-        config: Dictionary with anomaly classifier configuration:
-            - model_name (str):         HuggingFace model ID.
-            - num_classes (int):        Number of output classes.
-            - clip_length (int):        Frames per input clip.
-            - stride (int):             Frame stride for sampling.
-            - anomaly_threshold (float): Score threshold for anomaly flag.
-            - device (str):             Device string.
-            - batch_size (int):         Inference batch size.
+    Raises:
+        AnomalyHeadNotFoundError: if ``head_weights`` does not exist.
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, feature_extractor: ClipFeatureExtractor | None = None):
         self.config = config
-        self.model_name = config.get("model_name", "MCG-NJU/videomae-base")
-        self.num_classes = config.get("num_classes", 14)
         self.clip_length = config.get("clip_length", 16)
-        self.stride = config.get("stride", 4)
-        self.anomaly_threshold = config.get("anomaly_threshold", 0.65)
-        self.batch_size = config.get("batch_size", 1)
+        self.anomaly_threshold = config.get("anomaly_threshold", 0.5)
+        self.device = resolve_device(config.get("device", "auto"))
+        backbone = config.get("backbone", DEFAULT_BACKBONE)
 
-        # Device
-        device_str = config.get("device", "auto")
-        if device_str == "auto":
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = torch.device(device_str)
+        # Load the head first: it is cheap and fails fast if missing.
+        self.head, ckpt = load_head(config.get("head_weights", DEFAULT_HEAD_WEIGHTS), self.device)
+        if ckpt.get("backbone") and ckpt["backbone"] != backbone:
+            logger.warning(
+                f"Head was trained on features from '{ckpt['backbone']}' but backbone "
+                f"is '{backbone}'. Using the head's backbone."
+            )
+            backbone = ckpt["backbone"]
+        self.backbone = backbone
 
-        # Latency tracking
+        self.features = feature_extractor or ClipFeatureExtractor(
+            backbone=backbone, device=self.device, clip_length=self.clip_length
+        )
+        if self.features.feature_dim != self.head.feature_dim:
+            raise ValueError(
+                f"Head expects {self.head.feature_dim}-d features, backbone gives "
+                f"{self.features.feature_dim}-d"
+            )
+
         self._latencies: list[float] = []
-
-        # Load model
-        self._load_model()
-
         logger.success(
-            f"AnomalyClassifier ready | model={self.model_name} | "
-            f"device={self.device} | clip_length={self.clip_length}"
+            f"AnomalyClassifier ready | backbone={self.backbone} | device={self.device}"
         )
 
-    # ── Public API ─────────────────────────────────────────
+    def score_features(self, features: np.ndarray) -> np.ndarray:
+        """Score pre-computed (N, D) embeddings."""
+        with torch.no_grad():
+            x = torch.as_tensor(features, dtype=torch.float32, device=self.device)
+            return self.head(x).cpu().numpy()
 
     def classify_clip(self, frames: list[np.ndarray]) -> AnomalyResult:
-        """Classify a video clip as normal or anomalous.
-
-        Args:
-            frames: List of BGR numpy arrays (exactly clip_length frames).
-                    Can be full frames or cropped bounding box regions.
-
-        Returns:
-            AnomalyResult with scores and classification.
-        """
+        """Score one clip of BGR frames."""
         t0 = time.perf_counter()
-
-        # Preprocess frames
-        pixel_values = self._preprocess(frames)
-        pixel_values = pixel_values.to(self.device)
-
-        # Inference
-        with torch.no_grad():
-            outputs = self.model(pixel_values)
-            logits = outputs.logits  # (1, num_classes)
-
-        # Post-process
-        probs = F.softmax(logits, dim=-1).cpu().numpy()[0]
-        predicted_idx = int(np.argmax(probs))
-
-        # Build class scores dict
-        class_labels = (
-            UCF_CRIME_CLASSES
-            if self.num_classes == 14
-            else [f"class_{i}" for i in range(self.num_classes)]
-        )
-        class_scores = {}
-        for i, label in enumerate(class_labels):
-            if i < len(probs):
-                class_scores[label] = float(probs[i])
-
-        # Anomaly score = 1 - P(Normal)
-        normal_prob = class_scores.get("Normal", probs[0])
-        anomaly_score = 1.0 - normal_prob
-
-        predicted_class = class_labels[predicted_idx] if predicted_idx < len(class_labels) else f"class_{predicted_idx}"
-
+        score = float(self.score_features(self.features.extract([frames]))[0])
         elapsed = time.perf_counter() - t0
-        latency_ms = elapsed * 1000
-        self._latencies.append(elapsed)
-
+        self._latencies = (self._latencies + [elapsed])[-100:]
         return AnomalyResult(
-            anomaly_score=anomaly_score,
-            predicted_class=predicted_class,
-            class_scores=class_scores,
-            is_anomaly=anomaly_score >= self.anomaly_threshold,
-            latency_ms=latency_ms,
+            anomaly_score=score,
+            is_anomaly=score >= self.anomaly_threshold,
+            latency_ms=elapsed * 1000,
         )
-
-    def extract_features(self, frames: list[np.ndarray]) -> np.ndarray:
-        """Extract feature embeddings from a clip (for MIL or downstream use).
-
-        Args:
-            frames: List of BGR numpy arrays.
-
-        Returns:
-            Feature vector as numpy array of shape (feature_dim,).
-        """
-        pixel_values = self._preprocess(frames).to(self.device)
-
-        with torch.no_grad():
-            outputs = self.model(pixel_values, output_hidden_states=True)
-            # Use [CLS] token from last hidden state
-            features = outputs.hidden_states[-1][:, 0, :]  # (1, D)
-
-        return features.cpu().numpy().squeeze()
 
     @property
     def avg_latency_ms(self) -> float:
-        if not self._latencies:
-            return 0.0
-        return float(np.mean(self._latencies[-50:])) * 1000
-
-    # ── Private helpers ────────────────────────────────────
-
-    def _load_model(self) -> None:
-        """Load VideoMAE model and processor from HuggingFace."""
-        if not HAS_TRANSFORMERS:
-            raise ImportError(
-                "transformers library required. Install: pip install transformers"
-            )
-
-        logger.info(f"Loading VideoMAE model: {self.model_name}")
-
-        self.processor = VideoMAEImageProcessor.from_pretrained(self.model_name)
-
-        self.model = VideoMAEForVideoClassification.from_pretrained(
-            self.model_name,
-            num_labels=self.num_classes,
-            ignore_mismatched_sizes=True,
-        )
-        self.model.to(self.device)
-        self.model.eval()
-
-        logger.debug("VideoMAE model loaded and set to eval mode")
-
-    def _preprocess(self, frames: list[np.ndarray]) -> torch.Tensor:
-        """Preprocess frames for VideoMAE input.
-
-        Handles:
-          - BGR → RGB conversion
-          - Frame count normalization (pad/sample to clip_length)
-          - Resize and normalize via VideoMAEImageProcessor
-
-        Args:
-            frames: List of BGR numpy arrays.
-
-        Returns:
-            Tensor of shape (1, C, T, H, W) ready for model input.
-        """
-        # Ensure correct clip length
-        frames = self._normalize_clip_length(frames)
-
-        # BGR → RGB conversion
-        rgb_frames = []
-        for frame in frames:
-            if len(frame.shape) == 3 and frame.shape[2] == 3:
-                rgb = frame[:, :, ::-1]  # BGR to RGB
-            else:
-                rgb = frame
-            rgb_frames.append(rgb)
-
-        # Process with VideoMAE processor
-        inputs = self.processor(
-            list(rgb_frames),
-            return_tensors="pt",
-        )
-
-        return inputs["pixel_values"]
-
-    def _normalize_clip_length(
-        self, frames: list[np.ndarray]
-    ) -> list[np.ndarray]:
-        """Ensure the clip has exactly clip_length frames.
-
-        Pads by repeating the last frame or uniformly samples if too long.
-        """
-        n = len(frames)
-        target = self.clip_length
-
-        if n == target:
-            return frames
-        elif n < target:
-            # Pad by repeating the last frame
-            padding = [frames[-1]] * (target - n)
-            return frames + padding
-        else:
-            # Uniform temporal sampling
-            indices = np.linspace(0, n - 1, target, dtype=int)
-            return [frames[i] for i in indices]
+        return float(np.mean(self._latencies)) * 1000 if self._latencies else 0.0

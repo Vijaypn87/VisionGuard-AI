@@ -1,0 +1,3 @@
+-r requirements-base.txt
+# GPU build of ONNX Runtime; do not install alongside the CPU 'onnxruntime' package.
+onnxruntime-gpu>=1.16.0

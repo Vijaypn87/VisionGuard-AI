@@ -116,7 +116,7 @@ class TestTrackColors:
         assert get_track_color(5) == get_track_color(5)
 
     def test_color_wrapping(self):
-        from src.utils import get_track_color, TRACK_COLORS
+        from src.utils import TRACK_COLORS, get_track_color
 
         n = len(TRACK_COLORS)
         assert get_track_color(0) == get_track_color(n)

@@ -18,14 +18,16 @@ Typical usage:
     source.stop()
 """
 
-import time
 import threading
+import time
 from collections import deque
 from pathlib import Path
 
 import cv2
 import numpy as np
 from loguru import logger
+
+from src.utils import redact_url
 
 
 class VideoSource:
@@ -85,7 +87,7 @@ class VideoSource:
         self._cap = cv2.VideoCapture(self.source)
 
         if not self._cap.isOpened():
-            raise RuntimeError(f"Cannot open video source: {self.source}")
+            raise RuntimeError(f"Cannot open video source: {redact_url(self.source)}")
 
         # Set properties (best-effort for webcams)
         if self._source_type == "webcam":
@@ -143,12 +145,14 @@ class VideoSource:
             self._frame_count += 1
             return frame
 
-        # Latest-frame reading for live sources
+        # Live sources: return the newest frame and drop older ones, so each
+        # frame is processed at most once and the pipeline never lags behind.
         with self._lock:
             if len(self._buffer) == 0:
                 return None
-
-            return self._buffer[-1]
+            frame = self._buffer[-1]
+            self._buffer.clear()
+            return frame
 
     def read_sequential(self) -> np.ndarray | None:
         """Read the oldest unprocessed frame (FIFO order).

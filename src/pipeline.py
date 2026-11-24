@@ -1,181 +1,165 @@
-"""End-to-end real-time video anomaly detection pipeline.
+"""End-to-end video anomaly detection pipeline.
 
-Orchestrates the three-stage detection → tracking → anomaly classification
-pipeline, managing frame flow, temporal buffers, visualization overlays,
-and output recording.
+    VideoSource → YOLOv8 + ByteTrack (detect & track) → anomaly scoring → overlays → display/save
 
-Architecture:
-    VideoSource → YOLOv8 (Detect) → ByteTrack (Track) → VideoMAE (Classify)
-                                                              ↓
-                                              Heatmap + Score Overlay → Display/Save
+Anomaly scoring uses a frozen VideoMAE backbone plus a MIL head that you train
+on UCF-Crime (``training/train_mil.py``). Two scoring modes:
 
-Typical usage:
+* ``frame`` (default) — score clips of whole frames. This matches how the head
+  is trained (UCF-Crime labels are per video, not per object).
+* ``track`` — score clips cropped around each tracked object. Experimental:
+  the head never saw object crops during training.
+
+If no trained head is available the pipeline still runs detection and
+tracking, and the overlay says that anomaly scoring is off.
+
+Usage:
     python -m src.pipeline --source video.mp4 --config configs/default.yaml
-
-    # Or programmatically:
-    pipeline = AnomalyDetectionPipeline(config)
-    pipeline.run(source="video.mp4")
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import time
-from collections import defaultdict
+from collections import deque
 from pathlib import Path
 
 import cv2
 import numpy as np
 from loguru import logger
 
-from src.anomaly_classifier import AnomalyClassifier
+from src.anomaly_classifier import AnomalyClassifier, AnomalyHeadNotFoundError
 from src.heatmap import (
     draw_alert_banner,
     draw_detections,
     draw_fps_overlay,
+    draw_status_text,
     generate_anomaly_heatmap,
 )
 from src.tracker import MultiObjectTracker
-from src.utils import FPSCounter, LatencyTracker, load_config, setup_logging
+from src.utils import FPSCounter, LatencyTracker, load_config, redact_url, setup_logging
 from src.video_io import VideoSource, VideoWriter
+
+SCENE_ID = -1  # key used for the whole-frame score in frame mode
 
 
 class AnomalyDetectionPipeline:
-    """Real-time multi-object tracking and anomaly detection pipeline.
-
-    Combines YOLOv8 object detection, ByteTrack multi-object tracking,
-    and VideoMAE temporal anomaly classification into a unified, real-time
-    pipeline sustaining 30+ FPS on GPU hardware.
-
-    The pipeline reduces inference latency by 40% through:
-      - FP16 (half-precision) inference for detection
-      - Async video I/O with threaded frame buffering
-      - Selective anomaly classification (only on mature tracks)
-      - Temporal stride-based clip sampling
+    """Detection + tracking + (optional) anomaly scoring.
 
     Args:
-        config: Full pipeline configuration dictionary.
+        config:     Full pipeline configuration dictionary.
+        tracker:    Optional pre-built tracker (for tests).
+        classifier: Optional pre-built classifier (for tests). Pass ``False``
+                    to force anomaly scoring off.
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, tracker=None, classifier=None):
         self.config = config
+        setup_logging(level=config.get("pipeline", {}).get("log_level", "INFO"))
 
-        # Setup logging
-        log_level = config.get("pipeline", {}).get("log_level", "INFO")
-        setup_logging(level=log_level)
+        anomaly_cfg = config.get("anomaly", {})
+        self.mode = anomaly_cfg.get("mode", "frame")
+        if self.mode not in ("frame", "track"):
+            raise ValueError(f"anomaly.mode must be 'frame' or 'track', got {self.mode!r}")
+        self.clip_length = anomaly_cfg.get("clip_length", 16)
+        self.stride = max(1, anomaly_cfg.get("stride", 8))
+        self.anomaly_threshold = anomaly_cfg.get("anomaly_threshold", 0.5)
 
-        # Initialize components
-        logger.info("=" * 60)
-        logger.info("Initializing Anomaly Detection Pipeline")
-        logger.info("=" * 60)
-
-        self.tracker = MultiObjectTracker(
+        self.tracker = tracker or MultiObjectTracker(
             config=config.get("tracker", {}),
             detector_config=config.get("detector", {}),
         )
+        self.track_buffer = self.tracker.track_buffer
 
-        self.classifier = AnomalyClassifier(config.get("anomaly", {}))
+        self.classifier: AnomalyClassifier | None
+        self.anomaly_status: str
+        if classifier is False:
+            self.classifier, self.anomaly_status = None, "disabled"
+        elif classifier is not None:
+            self.classifier, self.anomaly_status = classifier, "loaded"
+        else:
+            try:
+                self.classifier = AnomalyClassifier(anomaly_cfg)
+                self.anomaly_status = "loaded"
+            except AnomalyHeadNotFoundError as e:
+                logger.warning(f"Anomaly scoring disabled: {e}")
+                self.classifier, self.anomaly_status = None, "no trained head"
 
-        # State
-        self._anomaly_scores: dict[int, float] = {}
-        self._anomaly_history: dict[int, list[float]] = defaultdict(list)
-        self._frame_buffers: dict[int, list[np.ndarray]] = defaultdict(list)
+        # Per-key state; key is a track id, or SCENE_ID in frame mode.
+        self._clips: dict[int, deque[np.ndarray]] = {}
+        self._scores: dict[int, float] = {}
+        self._last_seen: dict[int, int] = {}
+        self._in_alert: set[int] = set()
+
         self._fps_counter = FPSCounter(smoothing=0.05)
         self._latency_tracker = LatencyTracker()
         self._alert_log: list[dict] = []
+        self._classification_errors = 0
         self._frame_idx = 0
+        self._wall_start: float | None = None
 
-        # Configuration
-        self.clip_length = config.get("anomaly", {}).get("clip_length", 16)
-        self.stride = config.get("anomaly", {}).get("stride", 4)
-        self.anomaly_threshold = config.get("anomaly", {}).get("anomaly_threshold", 0.65)
-        self.show_display = config.get("pipeline", {}).get("show_display", True)
-        self.save_output = config.get("pipeline", {}).get("save_output", True)
-        self.output_path = config.get("pipeline", {}).get("output_path", "outputs/")
+        pipe_cfg = config.get("pipeline", {})
+        self.show_display = pipe_cfg.get("show_display", True)
+        self.save_output = pipe_cfg.get("save_output", True)
+        self.output_path = pipe_cfg.get("output_path", "outputs/")
         self.viz_config = config.get("visualization", {})
 
-        logger.success("Pipeline initialized successfully")
+        logger.success(
+            f"Pipeline initialized | anomaly scoring: {self.anomaly_status} | mode={self.mode}"
+        )
 
     # ── Public API ─────────────────────────────────────────
 
     def run(self, source: int | str | None = None) -> dict:
-        """Run the full anomaly detection pipeline.
-
-        Args:
-            source: Video source override (webcam index, RTSP URL, or file path).
-                    If None, uses the source from config.
-
-        Returns:
-            Dictionary with pipeline statistics and alert log.
-        """
+        """Run on a webcam index, stream URL or file path; returns run statistics."""
         if source is None:
             source = self.config.get("video", {}).get("source", 0)
 
-        video_config = self.config.get("video", {})
+        video_cfg = self.config.get("video", {})
         video_source = VideoSource(
             source=source,
-            width=video_config.get("width", 1280),
-            height=video_config.get("height", 720),
-            fps=video_config.get("fps", 30),
-            buffer_size=video_config.get("buffer_size", 64),
+            width=video_cfg.get("width", 1280),
+            height=video_cfg.get("height", 720),
+            fps=video_cfg.get("fps", 30),
+            buffer_size=video_cfg.get("buffer_size", 64),
         )
 
-        # Output writer
         writer = None
-        if self.save_output:
-            Path(self.output_path).mkdir(parents=True, exist_ok=True)
-            output_file = str(Path(self.output_path) / "output.mp4")
-
-        logger.info(f"Starting pipeline | source={source}")
+        logger.info(f"Starting pipeline | source={redact_url(source)}")
+        self._wall_start = time.perf_counter()
 
         try:
             video_source.start()
 
             if self.save_output:
+                Path(self.output_path).mkdir(parents=True, exist_ok=True)
                 w, h = video_source.resolution
-                writer_fps = video_source.actual_fps
-
-                # For video files, preserve the source video's original FPS.
-                if isinstance(source, str):
-                    cap = cv2.VideoCapture(source)
-                    source_fps = cap.get(cv2.CAP_PROP_FPS)
-                    cap.release()
-
-                    if source_fps and source_fps > 1:
-                        writer_fps = source_fps
-
                 writer = VideoWriter(
-                    output_path=output_file,
-                    fps=writer_fps,
+                    output_path=str(Path(self.output_path) / "output.mp4"),
+                    fps=video_source.actual_fps,
                     width=w,
                     height=h,
                 )
 
-            # Wait briefly for buffer to fill
-            time.sleep(0.5)
-
             while video_source.is_running:
                 frame = video_source.read()
-
                 if frame is None:
                     time.sleep(0.001)
                     continue
 
-                # Debug: show processing progress
                 if self._frame_idx % 100 == 0:
                     logger.info(f"Processing frame {self._frame_idx}")
 
-                # Process frame
                 annotated = self.process_frame(frame)
 
-                # Display
                 if self.show_display:
                     cv2.imshow("Anomaly Detection Pipeline", annotated)
                     key = cv2.waitKey(1) & 0xFF
-                    if key == ord("q") or key == 27:  # q or ESC
+                    if key in (ord("q"), 27):
                         logger.info("User requested stop")
                         break
 
-                # Save
                 if writer is not None:
                     writer.write(annotated)
 
@@ -188,268 +172,200 @@ class AnomalyDetectionPipeline:
             if self.show_display:
                 cv2.destroyAllWindows()
 
-        # Generate summary
         stats = self._generate_stats()
         logger.info(f"Pipeline finished | {stats['total_frames']} frames processed")
         return stats
 
     def process_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Process a single frame through the full pipeline.
-
-        Steps:
-          1. Run YOLOv8 + ByteTrack detection and tracking.
-          2. Buffer tracked object crops for temporal analysis.
-          3. Run VideoMAE classification on mature track clips.
-          4. Generate visualizations and overlays.
-
-        Args:
-            frame: BGR input frame.
-
-        Returns:
-            Annotated frame with all overlays.
-        """
+        """Detect, track, score and annotate one BGR frame."""
         self._frame_idx += 1
         self._fps_counter.tick()
 
-        # ── Stage 1+2: Detection + Tracking ────────────────
         t0 = time.perf_counter()
         tracks = self.tracker.update(frame)
         track_ms = (time.perf_counter() - t0) * 1000
         self._latency_tracker.record("detection+tracking", track_ms)
 
-        # ── Buffer frames for tracked objects ──────────────
-        for track in tracks:
-            tid = track.track_id
-            x1, y1, x2, y2 = track.bbox.astype(int)
-
-            # Clamp to frame bounds
-            h, w = frame.shape[:2]
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(w, x2)
-            y2 = min(h, y2)
-
-            if x2 - x1 > 10 and y2 - y1 > 10:
-                crop = frame[y1:y2, x1:x2].copy()
-                self._frame_buffers[tid].append(crop)
-
-                # Keep buffer bounded
-                max_buffer = self.clip_length * 2
-                if len(self._frame_buffers[tid]) > max_buffer:
-                    self._frame_buffers[tid] = self._frame_buffers[tid][-max_buffer:]
-
-        # ── Stage 3: Anomaly Classification ────────────────
         classifier_ms = 0.0
-        if self._frame_idx % self.stride == 0:
-            t1 = time.perf_counter()
-            self._run_anomaly_classification(tracks)
-            classifier_ms = (time.perf_counter() - t1) * 1000
-            self._latency_tracker.record("classification", classifier_ms)
+        if self.classifier is not None:
+            self._buffer_clips(frame, tracks)
+            if self._frame_idx % self.stride == 0:
+                t1 = time.perf_counter()
+                self._score_clips(tracks)
+                classifier_ms = (time.perf_counter() - t1) * 1000
+                self._latency_tracker.record("classification", classifier_ms)
+            self._prune_stale()
 
-        # ── Visualization ──────────────────────────────────
-        annotated = frame.copy()
+        return self._annotate(frame, tracks, track_ms, classifier_ms)
 
-        # Heatmap overlay
-        if self.viz_config.get("show_heatmap", True) and self._anomaly_scores:
+    # ── Scoring ────────────────────────────────────────────
+
+    def _keys_for(self, tracks: list) -> list[int]:
+        return [SCENE_ID] if self.mode == "frame" else [t.track_id for t in tracks]
+
+    def _buffer_clips(self, frame: np.ndarray, tracks: list) -> None:
+        if self.mode == "frame":
+            self._push(SCENE_ID, frame)
+            return
+
+        h, w = frame.shape[:2]
+        for track in tracks:
+            x1, y1, x2, y2 = track.bbox.astype(int)
+            x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+            if x2 - x1 > 10 and y2 - y1 > 10:
+                self._push(track.track_id, frame[y1:y2, x1:x2].copy())
+
+    def _push(self, key: int, image: np.ndarray) -> None:
+        if key not in self._clips:
+            self._clips[key] = deque(maxlen=self.clip_length)
+        self._clips[key].append(image)
+        self._last_seen[key] = self._frame_idx
+
+    def _score_clips(self, tracks: list) -> None:
+        mature = {t.track_id for t in tracks if t.frame_count >= self.tracker.min_track_length}
+        for key in self._keys_for(tracks):
+            clip = self._clips.get(key)
+            if clip is None or len(clip) < self.clip_length:
+                continue
+            if key != SCENE_ID and key not in mature:
+                continue
+            try:
+                result = self.classifier.classify_clip(list(clip))
+            except Exception:
+                self._classification_errors += 1
+                if self._classification_errors <= 3:
+                    logger.exception(f"Classification failed for key {key}")
+                continue
+            self._scores[key] = result.anomaly_score
+            self._update_alert_state(key, result.anomaly_score)
+
+    def _update_alert_state(self, key: int, score: float) -> None:
+        """Log one alert when a key crosses the threshold, not on every scoring step."""
+        if score >= self.anomaly_threshold and key not in self._in_alert:
+            self._in_alert.add(key)
+            alert = {
+                "frame_idx": self._frame_idx,
+                "target": "scene" if key == SCENE_ID else f"track {key}",
+                "score": round(score, 4),
+                "timestamp": time.time(),
+            }
+            self._alert_log.append(alert)
+            logger.warning(f"ANOMALY | {alert['target']} | score={score:.3f}")
+        elif score < self.anomaly_threshold:
+            self._in_alert.discard(key)
+
+    def _prune_stale(self) -> None:
+        """Drop buffers and scores of tracks unseen for longer than the track buffer."""
+        cutoff = self._frame_idx - self.track_buffer
+        for key in [k for k, seen in self._last_seen.items() if seen < cutoff]:
+            self._clips.pop(key, None)
+            self._scores.pop(key, None)
+            self._last_seen.pop(key, None)
+            self._in_alert.discard(key)
+
+    # ── Visualization ──────────────────────────────────────
+
+    def _annotate(self, frame, tracks, track_ms: float, classifier_ms: float) -> np.ndarray:
+        annotated = frame
+        visible = {t.track_id for t in tracks}
+        track_scores = {k: v for k, v in self._scores.items() if k in visible}
+
+        if self.viz_config.get("show_heatmap", True) and track_scores:
             annotated = generate_anomaly_heatmap(
-                annotated,
-                tracks,
-                self._anomaly_scores,
-                alpha=self.viz_config.get("heatmap_alpha", 0.4),
+                annotated, tracks, track_scores, alpha=self.viz_config.get("heatmap_alpha", 0.4)
             )
 
-        # Detection boxes, tracks, and scores
         annotated = draw_detections(
             annotated,
             tracks,
-            anomaly_scores=self._anomaly_scores,
+            anomaly_scores=track_scores,
             config={**self.viz_config, "anomaly_threshold": self.anomaly_threshold},
         )
 
-        # FPS overlay
         if self.viz_config.get("show_fps", True):
             annotated = draw_fps_overlay(
                 annotated,
                 fps=self._fps_counter.fps,
                 detector_ms=track_ms,
-                tracker_ms=0,  # Combined with detector
+                tracker_ms=0,  # included in detector_ms (YOLO .track())
                 classifier_ms=classifier_ms,
                 num_tracks=self.tracker.num_active_tracks,
             )
 
-        # Alert banner for active anomalies
-        active_anomalies = [
-            (tid, score)
-            for tid, score in self._anomaly_scores.items()
-            if score >= self.anomaly_threshold
-        ]
-        if active_anomalies:
-            worst_tid, worst_score = max(active_anomalies, key=lambda x: x[1])
-            annotated = draw_alert_banner(
-                annotated,
-                f"Track #{worst_tid} — Score: {worst_score:.2f}",
-                severity="critical",
-            )
+        if self.classifier is None:
+            annotated = draw_status_text(annotated, f"Anomaly scoring OFF ({self.anomaly_status})")
+        elif self.mode == "frame" and SCENE_ID in self._scores:
+            annotated = draw_status_text(annotated, f"Scene anomaly score: {self._scores[SCENE_ID]:.2f}")
+
+        # Banner only for things currently in view.
+        active = [(k, s) for k, s in self._scores.items() if s >= self.anomaly_threshold and (k == SCENE_ID or k in visible)]
+        if active:
+            key, score = max(active, key=lambda x: x[1])
+            target = "Scene" if key == SCENE_ID else f"Track #{key}"
+            annotated = draw_alert_banner(annotated, f"{target} - Score: {score:.2f}", severity="critical")
 
         return annotated
 
-    # ── Private helpers ────────────────────────────────────
-
-    def _run_anomaly_classification(self, tracks: list) -> None:
-        """Run anomaly classification on tracks with sufficient frame history."""
-        for track in tracks:
-            tid = track.track_id
-            buffer = self._frame_buffers.get(tid, [])
-
-            if len(buffer) < self.clip_length:
-                continue
-
-            # Only classify if track is mature enough
-            if track.frame_count < self.tracker.min_track_length:
-                continue
-
-            # Get the latest clip
-            clip = buffer[-self.clip_length:]
-
-            try:
-                result = self.classifier.classify_clip(clip)
-                self._anomaly_scores[tid] = result.anomaly_score
-                self._anomaly_history[tid].append(result.anomaly_score)
-
-                # Log anomaly alerts
-                if result.is_anomaly:
-                    alert = {
-                        "frame_idx": self._frame_idx,
-                        "track_id": tid,
-                        "score": result.anomaly_score,
-                        "class": result.predicted_class,
-                        "timestamp": time.time(),
-                    }
-                    self._alert_log.append(alert)
-                    logger.warning(
-                        f"ANOMALY DETECTED | Track #{tid} | "
-                        f"Score: {result.anomaly_score:.3f} | "
-                        f"Class: {result.predicted_class}"
-                    )
-            except Exception as e:
-                logger.error(f"Classification failed for track {tid}: {e}")
+    # ── Stats ──────────────────────────────────────────────
 
     def _generate_stats(self) -> dict:
-        """Generate pipeline run statistics."""
-        latency_summary = self._latency_tracker.summary()
-
+        wall = time.perf_counter() - self._wall_start if self._wall_start else 0.0
         stats = {
             "total_frames": self._frame_idx,
-            "avg_fps": self._fps_counter.fps,
+            "avg_fps": self._frame_idx / wall if wall > 0 else 0.0,
             "total_tracks": self.tracker.total_tracks,
+            "anomaly_scoring": self.anomaly_status,
+            "anomaly_mode": self.mode,
             "total_alerts": len(self._alert_log),
-            "latency": latency_summary,
-            "alerts": self._alert_log[-50:],  # Last 50 alerts
+            "classification_errors": self._classification_errors,
+            "latency": self._latency_tracker.summary(),
+            "alerts": self._alert_log[-50:],
         }
-
-        # Save stats to JSON
         stats_path = Path(self.output_path) / "pipeline_stats.json"
         stats_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(stats_path, "w") as f:
-            json.dump(stats, f, indent=2, default=str)
-
+        stats_path.write_text(json.dumps(stats, indent=2, default=str))
         logger.info(f"Stats saved to {stats_path}")
         return stats
 
 
-# ── CLI Entry Point ────────────────────────────────────────
+# ── CLI ────────────────────────────────────────────────────
 
-def main():
-    """Command-line entry point for the anomaly detection pipeline."""
-    parser = argparse.ArgumentParser(
-        description="Real-Time Video Anomaly Detection Pipeline",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Run on webcam
-  python -m src.pipeline --source 0
 
-  # Run on video file
-  python -m src.pipeline --source surveillance.mp4
-
-  # Run on RTSP stream
-  python -m src.pipeline --source rtsp://camera.local/stream
-
-  # Run with custom config
-  python -m src.pipeline --config configs/default.yaml --source video.mp4
-
-  # Run without display (headless)
-  python -m src.pipeline --source video.mp4 --no-display
-        """,
-    )
-
-    parser.add_argument(
-        "--source",
-        type=str,
-        default="0",
-        help="Video source: webcam index (0), RTSP URL, or file path",
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/default.yaml",
-        help="Path to YAML configuration file",
-    )
-    parser.add_argument(
-        "--no-display",
-        action="store_true",
-        help="Run in headless mode (no OpenCV window)",
-    )
-    parser.add_argument(
-        "--save-output",
-        action="store_true",
-        default=True,
-        help="Save annotated output video",
-    )
-    parser.add_argument(
-        "--output-path",
-        type=str,
-        default="outputs/",
-        help="Directory for output files",
-    )
-    parser.add_argument(
-        "--show-fps",
-        action="store_true",
-        default=True,
-        help="Display FPS counter overlay",
-    )
-
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Video anomaly detection pipeline")
+    parser.add_argument("--source", default="0", help="Webcam index, RTSP URL, or file path")
+    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--no-display", action="store_true", help="Headless mode (no window)")
+    parser.add_argument("--no-save", action="store_true", help="Do not write the annotated video")
+    parser.add_argument("--output-path", default="outputs/")
+    parser.add_argument("--hide-fps", action="store_true", help="Hide the FPS overlay")
+    parser.add_argument("--mode", choices=["frame", "track"], help="Override anomaly.mode")
     args = parser.parse_args()
 
-    # Load config
     config = load_config(args.config)
-
-    # Apply CLI overrides
+    pipe = config.setdefault("pipeline", {})
     if args.no_display:
-        config.setdefault("pipeline", {})["show_display"] = False
-    config.setdefault("pipeline", {})["save_output"] = args.save_output
-    config.setdefault("pipeline", {})["output_path"] = args.output_path
-    config.setdefault("visualization", {})["show_fps"] = args.show_fps
+        pipe["show_display"] = False
+    pipe["save_output"] = not args.no_save
+    pipe["output_path"] = args.output_path
+    config.setdefault("visualization", {})["show_fps"] = not args.hide_fps
+    if args.mode:
+        config.setdefault("anomaly", {})["mode"] = args.mode
 
-    # Parse source (convert "0" to int for webcam)
-    source = args.source
-    try:
+    source: int | str = args.source
+    if isinstance(source, str) and source.isdigit():
         source = int(source)
-    except ValueError:
-        pass
 
-    # Run pipeline
-    pipeline = AnomalyDetectionPipeline(config)
-    stats = pipeline.run(source=source)
+    stats = AnomalyDetectionPipeline(config).run(source=source)
 
-    # Print summary
     print("\n" + "=" * 60)
     print("PIPELINE SUMMARY")
     print("=" * 60)
-    print(f"  Total Frames:  {stats['total_frames']}")
-    print(f"  Average FPS:   {stats['avg_fps']:.1f}")
-    print(f"  Total Tracks:  {stats['total_tracks']}")
-    print(f"  Total Alerts:  {stats['total_alerts']}")
+    print(f"  Total Frames:     {stats['total_frames']}")
+    print(f"  Average FPS:      {stats['avg_fps']:.1f}")
+    print(f"  Total Tracks:     {stats['total_tracks']}")
+    print(f"  Anomaly scoring:  {stats['anomaly_scoring']}")
+    print(f"  Total Alerts:     {stats['total_alerts']}")
     print("=" * 60)
 
 

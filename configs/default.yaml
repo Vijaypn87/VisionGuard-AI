@@ -20,15 +20,17 @@ tracker:
   match_threshold: 0.8               # IoU threshold for matching
   min_track_length: 5                # Minimum frames for a valid track
 
-# ── Anomaly Classifier (VideoMAE) ─────────────────────────
+# ── Anomaly scoring (VideoMAE features + trained MIL head) ─
+# The head must be trained first (python -m training.train_mil ...).
+# Without weights/anomaly_head.pt the pipeline runs detection + tracking only.
 anomaly:
-  model_name: "MCG-NJU/videomae-base"  # HuggingFace model ID
-  num_classes: 14                       # UCF-Crime classes (13 anomaly + 1 normal)
-  clip_length: 16                       # Number of frames per input clip
-  stride: 4                             # Frame stride for clip sampling
-  anomaly_threshold: 0.65              # Score above this → anomaly
-  device: "cpu"
-  batch_size: 1                        # Clips per batch for inference
+  backbone: "MCG-NJU/videomae-base-finetuned-kinetics"  # frozen feature extractor
+  head_weights: "weights/anomaly_head.pt"               # produced by training/train_mil.py
+  mode: "frame"                         # "frame" (matches training) | "track" (experimental, per-object crops)
+  clip_length: 16                       # consecutive frames per clip
+  stride: 8                             # score a new clip every N frames
+  anomaly_threshold: 0.5                # tune on validation data after training
+  device: "cpu"                         # "auto" | "cpu" | "cuda:0"
 
 # ── Video I/O ─────────────────────────────────────────────
 video:

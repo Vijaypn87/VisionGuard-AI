@@ -1,4 +1,4 @@
-name: CI — Anomaly Detection Pipeline
+name: CI
 
 on:
   push:
@@ -20,31 +20,21 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
 
       - name: Install system dependencies
-        continue-on-error: true
         run: |
-          sudo apt-get update || true
-          sudo apt-get install -y libgl1-mesa-glx libglib2.0-0 || true
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libglib2.0-0
 
-      - name: Install Python dependencies
+      - name: Install Python dependencies (CPU-only torch)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-cov
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-dev.txt
 
-      - name: Run unit tests
-        run: |
-          python -m pytest tests/ -v --tb=short --co -q 2>/dev/null || true
-          python -m pytest tests/test_pipeline.py -v --tb=short -k "not TestObjectDetector and not TestMultiObjectTracker"
-
-      - name: Check imports
-        run: |
-          python -c "from src.detector import ObjectDetector, Detection; print('✓ detector')"
-          python -c "from src.tracker import MultiObjectTracker, Track; print('✓ tracker')"
-          python -c "from src.anomaly_classifier import AnomalyClassifier, UCF_CRIME_CLASSES; print('✓ classifier')"
-          python -c "from src.utils import FPSCounter, LatencyTracker, load_config; print('✓ utils')"
-          python -c "from src.heatmap import draw_detections, generate_anomaly_heatmap; print('✓ heatmap')"
+      - name: Run tests
+        run: python -m pytest -v --tb=short
 
   lint:
     runs-on: ubuntu-latest
@@ -57,9 +47,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install linters
+      - name: Install ruff
         run: pip install ruff
 
-      - name: Run Ruff linter
-        run: |
-          ruff check src evaluation optimization --ignore E501 || true
+      - name: Run ruff
+        run: ruff check .

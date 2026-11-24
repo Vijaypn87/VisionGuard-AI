@@ -1,0 +1,13 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = ["E501", "B905"]
+
+[tool.ruff.lint.per-file-ignores]
+"dashboard/app.py" = ["E402"]  # sys.path tweak must precede project imports
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

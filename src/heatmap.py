@@ -1,15 +1,13 @@
 """Anomaly heatmap and visualization overlays.
 
 Generates visual explanations for detected anomalies, including:
-  - Grad-CAM style saliency maps on anomalous regions.
+  - Score-weighted heatmaps over scored objects. These are NOT Grad-CAM or
+    any other model-attention map: each box gets a Gaussian blob scaled by its
+    anomaly score, so they show *which object* scored high, not *why*.
   - Color-coded bounding boxes (green=normal, red=anomalous).
   - Anomaly score bars and tracking trajectories.
   - FPS and system status overlays.
 
-These visualizations are critical for:
-  1. Explainability — stakeholders can verify WHY the system flagged something.
-  2. Debugging — engineers can visually inspect model attention.
-  3. Demo quality — impressive real-time visualization for portfolio/interviews.
 """
 
 import cv2
@@ -107,10 +105,10 @@ def generate_anomaly_heatmap(
     anomaly_scores: dict[int, float],
     alpha: float = 0.4,
 ) -> np.ndarray:
-    """Generate a Grad-CAM style anomaly heatmap overlay.
+    """Overlay a score-weighted heatmap on scored track boxes.
 
-    Creates a spatial heatmap where anomalous track regions glow red,
-    providing visual explainability for detected anomalies.
+    Each scored box gets a Gaussian blob scaled by its anomaly score. This is a
+    visual cue only; it is not derived from model gradients or attention.
 
     Args:
         frame:          BGR image.
@@ -268,11 +266,11 @@ def draw_alert_banner(
     if severity == "critical":
         bg_color = (0, 0, 200)
         text_color = (255, 255, 255)
-        prefix = "⚠ ANOMALY DETECTED"
+        prefix = "ANOMALY DETECTED"
     else:
         bg_color = (0, 165, 255)
         text_color = (0, 0, 0)
-        prefix = "⚡ ALERT"
+        prefix = "ALERT"
 
     banner_h = 40
     overlay = annotated.copy()
@@ -291,6 +289,17 @@ def draw_alert_banner(
         cv2.LINE_AA,
     )
 
+    return annotated
+
+
+def draw_status_text(frame: np.ndarray, text: str) -> np.ndarray:
+    """Draw a one-line status message in the top-right corner."""
+    annotated = frame.copy()
+    w = annotated.shape[1]
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    x = max(10, w - tw - 20)
+    cv2.rectangle(annotated, (x - 8, 12), (x + tw + 8, 22 + th), (0, 0, 0), -1)
+    cv2.putText(annotated, text, (x, 18 + th), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 255), 2, cv2.LINE_AA)
     return annotated
 
 

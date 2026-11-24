@@ -6,9 +6,10 @@
 tracker_type: bytetrack
 
 # ── Association thresholds ────────────────────────────────
-track_high_thresh: 0.5         # Detection confidence threshold for first association
+track_high_thresh: 0.25        # Detection confidence threshold for first association
 track_low_thresh: 0.1          # Detection confidence threshold for second association
-new_track_thresh: 0.6          # Detection confidence threshold for initializing new track
+new_track_thresh: 0.25         # Min confidence to start a track; if set far above the detector's
+                               # conf_threshold, low-confidence objects are detected but never tracked
 match_thresh: 0.8              # IoU matching threshold
 
 # ── Track lifecycle ──────────────────────────────────────
