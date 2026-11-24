@@ -11,16 +11,17 @@ Launch:
     streamlit run dashboard/app.py
 """
 
-import time
-import tempfile
+import shutil
 import sys
-from pathlib import Path
+import tempfile
+import time
 from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
-import streamlit as st
 import plotly.graph_objects as go
+import streamlit as st
 
 # Add project root to Python path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -28,6 +29,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.pipeline import AnomalyDetectionPipeline
 from src.utils import load_config
+
+DEMO_LABEL = "Simulated demo (random data)"
 
 # ── Page Config ────────────────────────────────────────────
 st.set_page_config(
@@ -93,8 +96,8 @@ def main():
 
         source_type = st.selectbox(
             "Video Source",
-            ["Webcam", "Video File", "RTSP Stream", "Demo Mode"],
-            index=3,
+            ["Video File", "Webcam", "RTSP Stream", DEMO_LABEL],
+            index=0,
         )
 
         if source_type == "Video File":
@@ -124,11 +127,12 @@ def main():
         st.divider()
 
         st.subheader("Model Info")
+        anomaly_cfg = load_config(PROJECT_ROOT / "configs/default.yaml").get("anomaly", {})
+        head_path = PROJECT_ROOT / anomaly_cfg.get("head_weights", "weights/anomaly_head.pt")
+        head_status = "trained head found" if head_path.exists() else "**no trained head — scoring off**"
         st.info(
-            "**Detector:** YOLOv8s\n"
-            "**Tracker:** ByteTrack\n"
-            "**Classifier:** VideoMAE-Base\n"
-            "**Dataset:** UCF-Crime"
+            "**Detector:** YOLOv8 + ByteTrack\n\n"
+            f"**Anomaly scoring:** VideoMAE features + MIL head ({head_status})"
         )
 
     # ── Main Content ───────────────────────────────────────
@@ -164,9 +168,12 @@ def main():
     st.subheader("🚨 Alert Log")
     alert_placeholder = st.empty()
 
-    # ── Run Demo Mode ──────────────────────────────────────
-        # ── Run Demo Mode ──────────────────────────────────────
-    if source_type == "Demo Mode":
+    # ── Simulated demo ─────────────────────────────────────
+    if source_type == DEMO_LABEL:
+        st.warning(
+            "Simulated demo: every box, score and alert below is random data. "
+            "No model is running."
+        )
         _run_demo_mode(
             video_placeholder=video_placeholder,
             fps_metric=fps_metric,
@@ -185,17 +192,13 @@ def main():
 
             if st.button("▶️ Start Analysis", type="primary"):
 
-                with st.spinner("Running AI video analysis..."):
-                    # Save uploaded video temporarily
-                    with tempfile.NamedTemporaryFile(
-                        delete=False,
-                        suffix=Path(_video_file.name).suffix,
-                    ) as temp_video:
-                        temp_video.write(_video_file.getbuffer())
-                        input_path = temp_video.name
+                # Per-run working dir so concurrent sessions never share files.
+                run_dir = Path(tempfile.mkdtemp(prefix="visionguard_"))
+                input_path = run_dir / f"input{Path(_video_file.name).suffix}"
+                input_path.write_bytes(_video_file.getbuffer())
 
-                    # Load project configuration
-                    config = load_config("configs/default.yaml")
+                with st.spinner("Running video analysis..."):
+                    config = load_config(PROJECT_ROOT / "configs/default.yaml")
 
                     # Use settings from dashboard
                     config.setdefault("detector", {})[
@@ -215,26 +218,25 @@ def main():
                     # Don't open an OpenCV window from Streamlit
                     config.setdefault("pipeline", {})["show_display"] = False
                     config.setdefault("pipeline", {})["save_output"] = True
-                    config.setdefault("pipeline", {})[
-                        "output_path"
-                    ] = "outputs"
+                    config.setdefault("pipeline", {})["output_path"] = str(run_dir)
 
-                    # Create and run the actual pipeline
-                    pipeline = AnomalyDetectionPipeline(config)
+                    try:
+                        pipeline = AnomalyDetectionPipeline(config)
+                        stats = pipeline.run(source=str(input_path))
+                        output_video = run_dir / "output.mp4"
+                        video_bytes = output_video.read_bytes() if output_video.exists() else None
+                    finally:
+                        shutil.rmtree(run_dir, ignore_errors=True)
 
-                    stats = pipeline.run(source=input_path)
+                st.success("Video analysis completed")
+                if stats["anomaly_scoring"] != "loaded":
+                    st.warning(
+                        f"Anomaly scoring was off ({stats['anomaly_scoring']}): only "
+                        "detection and tracking ran. Train a head with training/train_mil.py."
+                    )
 
-                st.success("✅ Video analysis completed!")
-
-                # Show processed video
-                output_video = Path("outputs/output.mp4")
-
-                if output_video.exists():
+                if video_bytes:
                     st.subheader("🎥 Processed Video")
-
-                    with open(output_video, "rb") as video:
-                        video_bytes = video.read()
-
                     st.video(video_bytes)
 
                 # Show actual pipeline statistics
@@ -304,13 +306,11 @@ def _run_demo_mode(
         video_placeholder.image(demo_frame, channels="BGR", use_container_width=True)
 
         # Update metrics
-        fps_val = 28 + np.random.uniform(-2, 4)
         num_tracks = np.random.randint(2, 8)
-        det_latency = 8 + np.random.uniform(-1, 3)
 
-        fps_metric.metric("FPS", f"{fps_val:.1f}", f"{fps_val - 30:.1f}")
-        tracks_metric.metric("Active Tracks", num_tracks)
-        latency_metric.metric("Detection Latency", f"{det_latency:.1f}ms")
+        fps_metric.metric("FPS", "n/a (simulated)")
+        tracks_metric.metric("Active Tracks (simulated)", num_tracks)
+        latency_metric.metric("Detection Latency", "n/a (simulated)")
 
         # Check for alerts
         if score >= anomaly_threshold:
@@ -318,7 +318,7 @@ def _run_demo_mode(
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "frame": frame_count,
                 "score": score,
-                "type": np.random.choice(["Fighting", "Robbery", "Vandalism", "Assault"]),
+                "type": "simulated",
             }
             alerts.append(alert)
 
@@ -386,14 +386,14 @@ def _generate_demo_frame(
         label = f"ID:{obj_idx + 1} Score:{obj_score:.2f}"
         cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-    # FPS overlay
+    # Watermark: this frame is not model output
     cv2.putText(
         frame,
-        f"FPS: {28 + np.random.uniform(-2, 4):.1f}",
+        "SIMULATED DATA - NO MODEL RUNNING",
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.8,
-        (0, 255, 0),
+        (0, 215, 255),
         2,
     )
 
@@ -402,7 +402,7 @@ def _generate_demo_frame(
         cv2.rectangle(frame, (0, 440), (854, 480), (0, 0, 200), -1)
         cv2.putText(
             frame,
-            f"ANOMALY DETECTED - Score: {anomaly_score:.3f}",
+            f"SIMULATED ANOMALY - Score: {anomaly_score:.3f}",
             (10, 465),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,

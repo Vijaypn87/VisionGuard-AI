@@ -8,14 +8,14 @@ Provides reusable utilities for the anomaly detection pipeline:
   - Color palette utilities
 """
 
+import re
 import time
-import yaml
-from pathlib import Path
 from contextlib import contextmanager
+from pathlib import Path
 
 import numpy as np
+import yaml
 from loguru import logger
-
 
 # ── FPS Counter ────────────────────────────────────────────
 
@@ -227,3 +227,8 @@ TRACK_COLORS = [
 def get_track_color(track_id: int) -> tuple[int, int, int]:
     """Get a consistent color for a track ID."""
     return TRACK_COLORS[track_id % len(TRACK_COLORS)]
+
+
+def redact_url(source: object) -> str:
+    """Hide credentials in stream URLs (``rtsp://user:pass@host`` → ``rtsp://***@host``)."""
+    return re.sub(r"(?<=://)[^/@\s]+@", "***@", str(source))

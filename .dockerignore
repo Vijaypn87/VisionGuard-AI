@@ -1,0 +1,8 @@
+.git
+__pycache__/
+*.mp4
+data/
+weights/
+outputs/
+venv/
+.venv/
